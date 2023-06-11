@@ -1,0 +1,19 @@
+[package]
+name = "one_pole"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "one_pole"
+path = "src/lib.rs"
+crate-type = ["cdylib","lib"]
+
+[[bin]]
+name = "one_pole_standalone"
+path = "src/main.rs"
+
+[dependencies]
+
+plugin_util = { git = "https://github.com/AquaEBM/plugin_util.git" }
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["standalone"] }
+core_simd = { git = "https://github.com/rust-lang/portable-simd.git" }
