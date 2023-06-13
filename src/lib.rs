@@ -1,20 +1,55 @@
 #![feature(portable_simd)]
 
-use std::{f32::consts::PI, sync::Arc, array};
+use std::{sync::Arc, array};
 
 use plugin_util::{
-    util::map,
-    smoothing::{LogSmoother, SIMDSmoother},
-    filter::Integrator,
+    filter::one_pole::OnePole,
+    simd::*
 };
 
 use nih_plug::prelude::*;
-use core_simd::simd::*;
+
+const MIN_FREQ: f32 = 13.;
+const MAX_FREQ: f32 = 21000.;
+const MAX_GAIN: f32 = 18.;
 
 #[derive(Params)]
 pub struct OnePoleParams {
     #[id = "cutoff"]
     cutoff: FloatParam,
+    #[id = "gain"]
+    gain: FloatParam,
+    #[id = "mode"]
+    mode: EnumParam<FilterMode>
+}
+
+#[derive(Enum, PartialEq, Eq)]
+enum FilterMode {
+    #[name = "Highpass"]
+    HP,
+    #[name = "Lowpass"]
+    LP,
+    #[name = "Allpass"]
+    AP,
+    #[name = "Low Shelf"]
+    LSH,
+    #[name = "High Shelf"]
+    HSH,
+}
+
+impl FilterMode {
+    pub fn output_function<const N: usize>(&self) -> fn(&OnePole<N>) -> Simd<f32, N>
+    where
+        LaneCount<N>: SupportedLaneCount
+    {
+        match self {
+            FilterMode::HP => OnePole::<N>::get_highpass,
+            FilterMode::LP => OnePole::<N>::get_lowpass,
+            FilterMode::AP => OnePole::<N>::get_allpass,
+            FilterMode::LSH => OnePole::<N>::get_lowshelf,
+            FilterMode::HSH => OnePole::<N>::get_highshelf,
+        }
+    }
 }
 
 impl Default for OnePoleParams {
@@ -24,69 +59,33 @@ impl Default for OnePoleParams {
 
             cutoff: FloatParam::new(
                 "Cutoff",
-                660.,
-                FloatRange::Skewed {
-                    min: 13.,
-                    max: 21000.,
-                    factor: 0.2,
-                },
-            ),
+                0.5,
+                FloatRange::Linear { min: 0., max: 1. }
+            )
+            .with_value_to_string(Arc::new(
+                |value| (MIN_FREQ * (MAX_FREQ / MIN_FREQ).powf(value)).to_string()
+            )),
+
+            gain: FloatParam::new(
+                "Gain",
+                0.,
+                FloatRange::Linear { min: -1., max: 1. }
+            )
+            .with_value_to_string(Arc::new(|value| MAX_GAIN.powf(value).to_string()))
+            .with_unit(" db"),
+
+            mode: EnumParam::new("Filter Mode", FilterMode::AP)
         }
     }
 }
 
 #[derive(Default)]
-pub struct OnePole<const N: usize>
-where
-    LaneCount<N>: SupportedLaneCount
-{
+pub struct OnePoleFilter {
     params: Arc<OnePoleParams>,
-    g: LogSmoother<N>,
-    integrator: Integrator<N>,
-    pi_tick: Simd<f32, N>,
+    filter: OnePole<2>,
 }
 
-impl<const N: usize> OnePole<N>
-where
-    LaneCount<N>: SupportedLaneCount
-{
-    fn update_smoothers(&mut self, block_len: usize) {
-        let target_cutoff = Simd::splat(self.params.cutoff.unmodulated_plain_value());
-        let g = map(target_cutoff * self.pi_tick, f32::tan);
-
-        self.g.set_target(
-            g / (Simd::splat(1.) + g),
-            block_len
-        );
-    }
-
-    fn process(&mut self, sample: Simd<f32, N>) -> Simd<f32, N> {
-
-        self.g.tick();
-
-        self.integrator.process(
-            sample - self.integrator.previous_output(),
-            *self.g.current()
-        )
-    }
-
-    fn reset(&mut self) {
-        self.integrator.reset()
-    }
-
-    fn set_sample_rate(&mut self, sr: f32) {
-        self.pi_tick = Simd::splat(PI / sr);
-    }
-
-    fn params(&self) -> Arc<dyn Params> {
-        self.params.clone()
-    }
-}
-
-impl<const N: usize> Plugin for OnePole<N>
-where
-    LaneCount<N>: SupportedLaneCount
-{
+impl Plugin for OnePoleFilter {
     const NAME: &'static str = "One Pole Filter";
 
     const VENDOR: &'static str = "AquaEBM";
@@ -107,8 +106,8 @@ where
 
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[
         AudioIOLayout {
-            main_input_channels: NonZeroU32::new(N as u32),
-            main_output_channels: NonZeroU32::new(N as u32),
+            main_input_channels: NonZeroU32::new(2),
+            main_output_channels: NonZeroU32::new(2),
             ..AudioIOLayout::const_default()
         }
     ];
@@ -118,7 +117,7 @@ where
     type BackgroundTask = ();
 
     fn params(&self) -> Arc<dyn Params> {
-        self.params()
+        self.params.clone()
     }
 
     fn process(
@@ -128,15 +127,33 @@ where
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
 
-        self.update_smoothers(buffer.samples());
+        let block_len = buffer.samples();
+
+        let cutoff = MIN_FREQ * (MAX_FREQ / MIN_FREQ).powf(
+            self.params.cutoff.unmodulated_plain_value()
+        );
+
+        let gain = MAX_GAIN.powf(self.params.gain.unmodulated_plain_value());
+
+        self.filter.set_params_smoothed(
+            Simd::splat(cutoff),
+            Simd::splat(gain),
+            block_len
+        );
+
+        let get_output = self.params.mode.unmodulated_plain_value().output_function::<2>();
 
         for mut frame in buffer.iter_samples() {
+
+            self.filter.update_smoothers();
 
             let mut sample = array::from_fn(
                 |i| *unsafe { frame.get_unchecked_mut(i) }
             ).into();
 
-            sample = self.process(sample);
+            self.filter.process(sample);
+
+            sample = get_output(&self.filter);
 
             unsafe {
                 *frame.get_unchecked_mut(0) = sample[0];
@@ -158,19 +175,16 @@ where
         _context: &mut impl InitContext<Self>,
     ) -> bool {
 
-        self.set_sample_rate(buffer_config.sample_rate);
+        self.filter.set_sample_rate(buffer_config.sample_rate);
         true
     }
 
     fn reset(&mut self) {
-        self.reset();
+        self.filter.reset();
     }
 }
 
-impl<const N: usize> Vst3Plugin for OnePole<N>
-where
-    LaneCount<N>: SupportedLaneCount
-{
+impl Vst3Plugin for OnePoleFilter {
     const VST3_CLASS_ID: [u8; 16] = *b"one_pole_monkeee";
 
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
@@ -179,10 +193,7 @@ where
     ];
 }
 
-impl<const N: usize> ClapPlugin for OnePole<N>
-where
-    LaneCount<N>: SupportedLaneCount
-{
+impl ClapPlugin for OnePoleFilter {
     const CLAP_ID: &'static str = "com.AquaEBM.one_pole_filter";
 
     const CLAP_DESCRIPTION: Option<&'static str> = Some("Linear one-pole Filter");
@@ -197,5 +208,5 @@ where
     ];
 }
 
-nih_export_clap!(OnePole<2>);
-nih_export_vst3!(OnePole<2>);
+nih_export_clap!(OnePoleFilter);
+nih_export_vst3!(OnePoleFilter);
