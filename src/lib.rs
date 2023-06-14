@@ -11,7 +11,6 @@ use nih_plug::prelude::*;
 
 const MIN_FREQ: f32 = 13.;
 const MAX_FREQ: f32 = 21000.;
-const MAX_GAIN: f32 = 18.;
 
 #[derive(Params)]
 pub struct OnePoleParams {
@@ -69,9 +68,8 @@ impl Default for OnePoleParams {
             gain: FloatParam::new(
                 "Gain",
                 0.,
-                FloatRange::Linear { min: -1., max: 1. }
+                FloatRange::Linear { min: -18., max: 18. }
             )
-            .with_value_to_string(Arc::new(|value| MAX_GAIN.powf(value).to_string()))
             .with_unit(" db"),
 
             mode: EnumParam::new("Filter Mode", FilterMode::AP)
@@ -133,7 +131,7 @@ impl Plugin for OnePoleFilter {
             self.params.cutoff.unmodulated_plain_value()
         );
 
-        let gain = MAX_GAIN.powf(self.params.gain.unmodulated_plain_value());
+        let gain = 10f32.powf(self.params.gain.unmodulated_plain_value() * (1. / 20.));
 
         self.filter.set_params_smoothed(
             Simd::splat(cutoff),
