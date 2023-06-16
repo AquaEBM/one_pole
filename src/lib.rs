@@ -68,7 +68,7 @@ impl Default for OnePoleParams {
             gain: FloatParam::new(
                 "Gain",
                 0.,
-                FloatRange::Linear { min: -18., max: 18. }
+                FloatRange::Linear { min: -30., max: 30. }
             )
             .with_unit(" db"),
 
@@ -131,7 +131,15 @@ impl Plugin for OnePoleFilter {
             self.params.cutoff.unmodulated_plain_value()
         );
 
-        let gain = 10f32.powf(self.params.gain.unmodulated_plain_value() * (1. / 20.));
+        let filter_mode = self.params.mode.unmodulated_plain_value();
+
+        let factor = match filter_mode {
+            FilterMode::LSH => -1.,
+            FilterMode::HSH => 1.,
+            _ => 0.,
+        };
+
+        let gain = 10f32.powf(self.params.gain.unmodulated_plain_value() * factor * (1. / 20.));
 
         self.filter.set_params_smoothed(
             Simd::splat(cutoff),
@@ -139,7 +147,7 @@ impl Plugin for OnePoleFilter {
             block_len
         );
 
-        let get_output = self.params.mode.unmodulated_plain_value().output_function::<2>();
+        let get_output = filter_mode.output_function::<2>();
 
         for mut frame in buffer.iter_samples() {
 
