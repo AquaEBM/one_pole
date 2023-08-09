@@ -68,7 +68,7 @@ impl Default for OnePoleParams {
             gain: FloatParam::new(
                 "Gain",
                 0.,
-                FloatRange::Linear { min: -30., max: 30. }
+                FloatRange::Linear { min: -18., max: 18. }
             )
             .with_unit(" db"),
 
@@ -125,41 +125,38 @@ impl Plugin for OnePoleFilter {
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
 
-        let block_len = buffer.samples();
+        let num_samples = buffer.samples();
 
-        let cutoff = MIN_FREQ * (MAX_FREQ / MIN_FREQ).powf(
+        let cutoff = Simd::splat(MIN_FREQ * (MAX_FREQ / MIN_FREQ).powf(
             self.params.cutoff.unmodulated_plain_value()
-        );
+        ));
 
         let filter_mode = self.params.mode.unmodulated_plain_value();
 
-        let factor = match filter_mode {
-            FilterMode::LSH => -1.,
-            FilterMode::HSH => 1.,
-            _ => 0.,
-        };
-
-        let gain = 10f32.powf(self.params.gain.unmodulated_plain_value() * factor * (1. / 20.));
-
-        self.filter.set_params_smoothed(
-            Simd::splat(cutoff),
-            Simd::splat(gain),
-            block_len
+        let gain = Simd::splat(
+            10f32.powf(self.params.gain.unmodulated_plain_value() * (1. / 20.))
         );
+
+        let f = &mut self.filter;
+
+        match filter_mode {
+            FilterMode::LSH => f.set_params_low_shelving_smoothed(cutoff, gain, num_samples),
+            FilterMode::HSH => f.set_params_high_shelving_smoothed(cutoff, gain, num_samples),
+            _ => f.set_cutoff_smoothed(cutoff, num_samples),
+        };
 
         let get_output = filter_mode.output_function::<2>();
 
         for mut frame in buffer.iter_samples() {
 
-            self.filter.update_smoothers();
-
             let mut sample = array::from_fn(
                 |i| *unsafe { frame.get_unchecked_mut(i) }
             ).into();
 
-            self.filter.process(sample);
+            f.update_smoothers();
+            f.process(sample);
 
-            sample = get_output(&self.filter);
+            sample = get_output(f);
 
             unsafe {
                 *frame.get_unchecked_mut(0) = sample[0];
