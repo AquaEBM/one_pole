@@ -1,16 +1,21 @@
 #![feature(portable_simd)]
 
-use std::{sync::Arc, array};
-
 use plugin_util::{
-    filter::one_pole::OnePole,
-    simd::*
+    filter::one_pole::{FilterMode, OnePole},
+    simd::*,
 };
 
 use nih_plug::prelude::*;
 
+use core::f32::consts::TAU;
+use std::sync::Arc;
+
 const MIN_FREQ: f32 = 13.;
 const MAX_FREQ: f32 = 21000.;
+
+const NUM_CHANNELS: usize = 2;
+
+type Filter = OnePole<NUM_CHANNELS>;
 
 #[derive(Params)]
 pub struct OnePoleParams {
@@ -19,68 +24,49 @@ pub struct OnePoleParams {
     #[id = "gain"]
     gain: FloatParam,
     #[id = "mode"]
-    mode: EnumParam<FilterMode>
-}
-
-#[derive(Enum, PartialEq, Eq)]
-enum FilterMode {
-    #[name = "Highpass"]
-    HP,
-    #[name = "Lowpass"]
-    LP,
-    #[name = "Allpass"]
-    AP,
-    #[name = "Low Shelf"]
-    LSH,
-    #[name = "High Shelf"]
-    HSH,
-}
-
-impl FilterMode {
-    pub fn output_function<const N: usize>(&self) -> fn(&OnePole<N>) -> Simd<f32, N>
-    where
-        LaneCount<N>: SupportedLaneCount
-    {
-        match self {
-            FilterMode::HP => OnePole::<N>::get_highpass,
-            FilterMode::LP => OnePole::<N>::get_lowpass,
-            FilterMode::AP => OnePole::<N>::get_allpass,
-            FilterMode::LSH => OnePole::<N>::get_lowshelf,
-            FilterMode::HSH => OnePole::<N>::get_highshelf,
-        }
-    }
+    mode: EnumParam<FilterMode>,
 }
 
 impl Default for OnePoleParams {
     fn default() -> Self {
-
         Self {
-
-            cutoff: FloatParam::new(
-                "Cutoff",
-                0.5,
-                FloatRange::Linear { min: 0., max: 1. }
-            )
-            .with_value_to_string(Arc::new(
-                |value| (MIN_FREQ * (MAX_FREQ / MIN_FREQ).powf(value)).to_string()
-            )),
+            cutoff: FloatParam::new("Cutoff", 0.5, FloatRange::Linear { min: 0., max: 1. })
+                .with_value_to_string(Arc::new(|value| {
+                    (MIN_FREQ * (MAX_FREQ / MIN_FREQ).powf(value)).to_string()
+                })),
 
             gain: FloatParam::new(
                 "Gain",
                 0.,
-                FloatRange::Linear { min: -18., max: 18. }
+                FloatRange::Linear {
+                    min: -30.,
+                    max: 30.,
+                },
             )
             .with_unit(" db"),
 
-            mode: EnumParam::new("Filter Mode", FilterMode::AP)
+            mode: EnumParam::new("Filter Mode", FilterMode::default()),
         }
+    }
+}
+
+impl OnePoleParams {
+    fn get_values(&self, pi_tick: f32) -> (f32x2, f32x2, FilterMode) {
+        let cutoff_normalized = self.cutoff.unmodulated_plain_value();
+        let gain_normalized = self.gain.unmodulated_plain_value();
+        (
+            Simd::splat(pi_tick * MIN_FREQ * (MAX_FREQ / MIN_FREQ).powf(cutoff_normalized)),
+            Simd::splat(10f32.powf(gain_normalized * (1. / 20.))),
+            self.mode.unmodulated_plain_value(),
+        )
     }
 }
 
 #[derive(Default)]
 pub struct OnePoleFilter {
     params: Arc<OnePoleParams>,
-    filter: OnePole<2>,
+    pi_tick: f32,
+    filter: Filter,
 }
 
 impl Plugin for OnePoleFilter {
@@ -102,13 +88,11 @@ impl Plugin for OnePoleFilter {
 
     const HARD_REALTIME_ONLY: bool = false;
 
-    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[
-        AudioIOLayout {
-            main_input_channels: NonZeroU32::new(2),
-            main_output_channels: NonZeroU32::new(2),
-            ..AudioIOLayout::const_default()
-        }
-    ];
+    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+        main_input_channels: NonZeroU32::new(NUM_CHANNELS as u32),
+        main_output_channels: NonZeroU32::new(NUM_CHANNELS as u32),
+        ..AudioIOLayout::const_default()
+    }];
 
     type SysExMessage = ();
 
@@ -124,34 +108,21 @@ impl Plugin for OnePoleFilter {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-
-        let num_samples = buffer.samples();
-
-        let cutoff = Simd::splat(MIN_FREQ * (MAX_FREQ / MIN_FREQ).powf(
-            self.params.cutoff.unmodulated_plain_value()
-        ));
-
-        let filter_mode = self.params.mode.unmodulated_plain_value();
-
-        let gain = Simd::splat(
-            10f32.powf(self.params.gain.unmodulated_plain_value() * (1. / 20.))
-        );
+        let (w_c, gain, mode) = self.params.get_values(self.pi_tick);
+        let update = Filter::get_smoothing_update_function(mode);
+        let get_output = Filter::get_output_function(mode);
 
         let f = &mut self.filter;
 
-        match filter_mode {
-            FilterMode::LSH => f.set_params_low_shelving_smoothed(cutoff, gain, num_samples),
-            FilterMode::HSH => f.set_params_high_shelving_smoothed(cutoff, gain, num_samples),
-            _ => f.set_cutoff_smoothed(cutoff, num_samples),
-        };
-
-        let get_output = filter_mode.output_function::<2>();
+        let num_samples = buffer.samples();
+        update(f, w_c, gain, num_samples);
 
         for mut frame in buffer.iter_samples() {
+            // SAFETY: we only support a stereo configuration so these indices are valid
 
-            let mut sample = array::from_fn(
-                |i| *unsafe { frame.get_unchecked_mut(i) }
-            ).into();
+            let mut sample = Simd::from_array(unsafe {
+                [*frame.get_unchecked_mut(0), *frame.get_unchecked_mut(1)]
+            });
 
             f.update_smoothers();
             f.process(sample);
@@ -177,8 +148,12 @@ impl Plugin for OnePoleFilter {
         buffer_config: &BufferConfig,
         _context: &mut impl InitContext<Self>,
     ) -> bool {
+        self.pi_tick = TAU / buffer_config.sample_rate;
 
-        self.filter.set_sample_rate(buffer_config.sample_rate);
+        let (w_c, gain, mode) = self.params.get_values(self.pi_tick);
+        let update = Filter::get_update_function(mode);
+
+        update(&mut self.filter, w_c, gain);
         true
     }
 
@@ -190,10 +165,8 @@ impl Plugin for OnePoleFilter {
 impl Vst3Plugin for OnePoleFilter {
     const VST3_CLASS_ID: [u8; 16] = *b"one_pole_monkeee";
 
-    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
-        Vst3SubCategory::Filter,
-        Vst3SubCategory::Fx,
-    ];
+    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] =
+        &[Vst3SubCategory::Filter, Vst3SubCategory::Fx];
 }
 
 impl ClapPlugin for OnePoleFilter {
@@ -205,10 +178,7 @@ impl ClapPlugin for OnePoleFilter {
 
     const CLAP_SUPPORT_URL: Option<&'static str> = None;
 
-    const CLAP_FEATURES: &'static [ClapFeature] = &[
-        ClapFeature::AudioEffect,
-        ClapFeature::Filter,
-    ];
+    const CLAP_FEATURES: &'static [ClapFeature] = &[ClapFeature::AudioEffect, ClapFeature::Filter];
 }
 
 nih_export_clap!(OnePoleFilter);
