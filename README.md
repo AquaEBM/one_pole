@@ -18,6 +18,4 @@ cd one_pole
 cargo +nightly nih-plug bundle one_pole --release
 ```
 
-From here, you can either copy the just created .vst3 or .clap file (found somewhere in "Krynth/target/release/bundled") into your system's VST3 or CLAP (if your DAW supports it) plugin folders, or add the folder containing it to the list of path's for your DAW to scan for when looking for plugins.
-
-Finally, rescan the plugin paths, and it should be usable from your DAW.
+From here, you can either copy the just created .vst3 or .clap file (found somewhere in "target/release/bundled") into your system's VST3 or CLAP (if your DAW supports it) plugin folders, or add the folder containing it to the list of path's for your DAW to scan for when looking for plugins (don't forget to rescan plugin paths).
